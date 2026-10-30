@@ -1,0 +1,26 @@
+# gem5 build products and raw outputs
+gem5/out/
+gem5/bench_O0
+gem5/bench_O2
+gem5/bench_O3
+gem5/bench_host
+gem5/m5out/
+gem5/*.png
+analysis/*.png
+analysis/scenarios.csv
+__pycache__/
+*.pyc
+
+# LaTeX build files
+report/*.aux
+report/*.log
+report/*.out
+report/*.fls
+report/*.fdb_latexmk
+report/*.synctex.gz
+report/*.pdf
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/

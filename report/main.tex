@@ -1,0 +1,330 @@
+\documentclass[12pt, a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{mathptmx}
+\usepackage{geometry}
+\geometry{a4paper, margin=1in}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{hyperref}
+\usepackage{setspace}
+\usepackage{caption}
+\usepackage{amsmath}
+\usepackage{xcolor}
+\usepackage[section]{placeins}
+
+\setstretch{1.15}
+\graphicspath{{figures/}{../figures/}{./}}
+
+% ---------- Đánh dấu chỗ cần điền/kiểm tra (xoá màu đỏ khi đã hoàn thiện) ----------
+\newcommand{\fillin}[1]{\textcolor{red}{#1}}
+% Chèn hình an toàn: nếu chưa upload hình lên Overleaf thì hiện khung báo thiếu thay vì lỗi biên dịch
+\newcommand{\safefig}[2]{\IfFileExists{../figures/#2}{\includegraphics[width=#1\textwidth]{../figures/#2}}{\IfFileExists{figures/#2}{\includegraphics[width=#1\textwidth]{figures/#2}}{\IfFileExists{#2}{\includegraphics[width=#1\textwidth]{#2}}{\fbox{\parbox{#1\textwidth}{\centering\vspace{1.5cm}\fillin{Missing figure: \texttt{\detokenize{#2}}}\vspace{1.5cm}}}}}}}
+
+\begin{document}
+\vspace{0.8cm}
+\begin{center}
+    \textbf{\Large RESEARCH REPORT TEMPLATE}
+\end{center}
+\vspace{0.5cm}
+% ================= HEADER =================
+\noindent
+\begin{tabularx}{\textwidth}{|p{4.5cm}|X|}
+\hline
+Report title & Evaluating the Impact of Instruction-Level Parallelism on Sensor-to-Storage Latency: A gem5 Simulation and ESP32-S3 Hardware Study of a Smart Weighing Station Controller \\
+\hline
+Group 6 & 1. Nguyen Thi Minh Chau - QE210105 \\
+ & 2. Nguyen Viet Hai - QE210045 \\
+ & 3. Dang Hoang Gia Bao - QE210197 \\
+\hline
+Class & AI21B \\
+\hline
+\end{tabularx}
+
+
+
+% ================= ABSTRACT =================
+\section*{Abstract}
+In a smart weighing station, the controller must capture a load-cell sample after a vehicle trigger, filter and calibrate it, and commit the record to storage. This report investigates whether Instruction-Level Parallelism (ILP) --- pipelining, multiple issue and out-of-order execution --- can significantly reduce this sensor-trigger-to-storage latency (CEA201, Q7). We decompose the end-to-end latency into five segments (interrupt, sensor wait, ADC, compute, storage) and combine two methods: (1) cycle-level gem5 simulation of the same weighing kernel on in-order (MinorCPU) and out-of-order (O3CPU) RISC-V cores at 240\,MHz, and (2) cycle-counter measurements on a real ESP32-S3 controller. ILP accelerates the compute segment by 1.5--6.5$\times$, but the gain saturates at about 2.2$\times$ for filters with serial data dependencies (IIR) and at about 2.5$\times$ for the full processing chain, which is dominated by a bit-serial CRC32. On real hardware, however, computation accounts for only 0.01--0.08\% of the end-to-end latency, which is dominated by the HX711 sample wait (6--50\,ms) and flash storage (31\,ms median, up to 138\,ms). Consequently, even the widest out-of-order core would reduce end-to-end latency by less than 0.05\%. A sensitivity analysis shows ILP becomes significant ($\geq$20\% reduction) only when the total I/O time falls below about 20\,$\mu$s at 240\,MHz. We conclude that latency in this application should be reduced at the I/O and memory-system level rather than through wider processor cores.
+
+\vspace{0.3cm}
+\noindent \textbf{Key words:} Instruction-Level Parallelism, Superscalar, Out-of-Order Execution, gem5, Amdahl's Law, Embedded Systems, Smart Weighing Station, Latency.
+
+\newpage
+
+% ================= INTRODUCTION =================
+\section{Introduction}
+\noindent \textbf{Background and Importance:} A smart weighing station must register a vehicle, sample the load cell, process the reading, and log a tamper-evident record within a bounded time. Modern processors improve performance through ILP --- executing several independent instructions per cycle using pipelining, superscalar issue and out-of-order (OoO) scheduling \cite{SmithSohi1995}. Whether such microarchitectural features benefit an I/O-driven embedded controller is not obvious, and choosing a more complex core increases cost, power and timing unpredictability \cite{Wilhelm2008}.
+
+\vspace{0.2cm}
+\noindent \textbf{Problem Statement:} \textit{Can instruction-level parallelism significantly reduce the latency between sensor trigger and data storage?} ILP can only shorten instructions executed on the CPU; it cannot shorten the waiting time of peripherals. The answer therefore depends on what fraction of the trigger-to-storage path is actually computation.
+
+\vspace{0.2cm}
+\noindent \textbf{Objectives \& Outline:}
+\begin{itemize}
+    \item \textbf{Research Question:} How much can ILP reduce (a) the compute latency and (b) the end-to-end trigger-to-storage latency of a weighing station controller, and under which conditions does the reduction become significant?
+    \item \textbf{Hypotheses:} \textbf{H1} --- ILP speedup of the compute segment is limited by the data-dependency structure of the algorithm. \textbf{H2} --- ILP does \emph{not} significantly reduce end-to-end latency because I/O dominates. \textbf{H3} --- latency variability (jitter) originates mainly from I/O rather than computation.
+    \item \textbf{Definition of ``significant'':} a reduction of at least 20\% of the end-to-end latency (fixed before the experiments).
+    \item \textbf{Main Contributions:} 1) A five-segment latency model of the weighing pipeline. 2) A gem5 design-space exploration of ILP (issue width, in-order vs.\ OoO, ROB size, compiler optimisation) using the same kernel as the hardware. 3) Hardware validation on an ESP32-S3 and a break-even analysis telling designers when ILP matters.
+\end{itemize}
+
+% ================= LITERATURE REVIEW =================
+\section{Literature Review}
+\noindent \textbf{Limits of ILP.} Jouppi and Wall found that typical programs expose only about two independent instructions per cycle, and that superscalar and superpipelined machines perform similarly \cite{JouppiWall1989}. Wall's limit study showed that, under realistic branch prediction and alias analysis, ILP rarely exceeds 5--7, mainly because of control and data dependencies \cite{Wall1991}. Smith and Sohi describe the hardware mechanisms --- branch prediction, register renaming, instruction windows and reorder buffers --- that extract this parallelism and their cost \cite{SmithSohi1995}.
+
+\vspace{0.2cm}
+\noindent \textbf{ILP and real-time behaviour.} Dynamic scheduling makes execution time hard to predict: Lundqvist and Stenström demonstrated \emph{timing anomalies}, where a local delay can shorten or lengthen total execution time unexpectedly \cite{Lundqvist1999}. Modelling OoO pipelines for worst-case execution time (WCET) is considerably more complex than for in-order cores \cite{Li2006}, and the WCET survey by Wilhelm et al.\ recommends predictable architectures for hard real-time systems \cite{Wilhelm2008}.
+
+\vspace{0.2cm}
+\noindent \textbf{Simulation methodology.} gem5 provides interchangeable CPU models from simple timing to detailed OoO \cite{Binkert2011, LowePower2020}. Endo et al.\ compared in-order and OoO ARM models in gem5 against real boards \cite{Endo2014}, and Butko et al.\ reported that gem5 errors relative to hardware vary by benchmark \cite{Butko2012}; both suggest using gem5 for relative comparisons rather than absolute cycle counts.
+
+\vspace{0.2cm}
+\noindent \fillin{[Optional: 1--2 sentences linking to the CEA201 track artifacts, e.g.\ the Interrupt-Logic Diagram, and to the RTOS reference collected by the group.]}
+
+% ================= METHODOLOGY =================
+\section{Methodology}
+\subsection{Latency Model}
+The trigger-to-storage latency of one weighing event is decomposed as
+\begin{equation}
+T_{total} = T_{irq} + T_{wait} + T_{adc} + T_{compute} + T_{store}.
+\end{equation}
+ILP only affects $T_{compute}$. If a core achieves a compute speedup $S$, Amdahl's law gives the end-to-end reduction
+\begin{equation}
+R = \frac{T_{compute}}{T_{total}}\left(1 - \frac{1}{S}\right),
+\end{equation}
+and ILP is significant when $R \geq 20\%$. Solving for the I/O time gives the break-even condition
+\begin{equation}
+T_{I/O}^{*} = \frac{T_{compute}^{base} - T_{compute}^{ILP}}{0.2} - T_{compute}^{base}.
+\end{equation}
+
+\subsection{Workload: Weighing Kernel}
+A portable C kernel (\texttt{weigh\_kernel.c}) is shared, unmodified, by the simulator and the hardware. Each sample is filtered, calibrated (Q16 fixed-point), packed into a 24-byte record and protected with a bit-serial CRC32. Four filters were chosen to contrast dependency structures with similar operation counts: \textbf{EMA1} (single exponential average), \textbf{IIR16} (16 cascaded stages --- a serial dependency chain), \textbf{FIR16} (16 independent multiply-accumulates) and \textbf{MED5} (median of five --- branch-heavy). Input samples come from a deterministic generator emulating a 24-bit load cell with noise and vehicle arrival/departure.
+
+\subsection{gem5 Simulation Setup}
+\begin{itemize}
+    \item \textbf{Simulator:} gem5 v26.0 (RISC-V, syscall-emulation mode) on WSL2 Ubuntu, AMD Ryzen 9, 24\,GB RAM.
+    \item \textbf{System:} 240\,MHz core (same clock as the ESP32-S3), 16\,KB L1-I and L1-D (4-way, 1-cycle), no L2, DDR3 main memory.
+    \item \textbf{CPU configurations:} TimingSimpleCPU (no pipeline); MinorCPU in-order with issue width 1 (baseline, comparable to a microcontroller) and 2 (dual-issue); O3CPU with width 1, 2, 4, 8 (ROB = 32$\times$width); ROB sweep 16--256 at width 4.
+    \item \textbf{Compiler:} \texttt{riscv64-linux-gnu-gcc} at \texttt{-O0}, \texttt{-O2}, \texttt{-O3 -funroll-loops}.
+    \item \textbf{Measurement:} m5ops reset/dump statistics around a region of interest of $N=2000$ samples after 64 warm-up samples; two regions per filter (filter only, full chain). Metric: cycles per sample.
+\end{itemize}
+
+\subsection{Hardware Measurement Setup}
+\begin{itemize}
+    \item \textbf{Board:} ESP32-S3 (Xtensa LX7, in-order, 240\,MHz), Arduino-ESP32 core 3.3, kernel compiled at \texttt{-O2}.
+    \item \textbf{Timing:} the CPU cycle counter (4.17\,ns resolution); the counter-read overhead (\texttt{OVH}) was measured and subtracted.
+    \item \textbf{Trigger:} a jumper wire loops GPIO4 (output) to GPIO5 (rising-edge interrupt), emulating a vehicle breaking a light beam; $T_{irq}$ is measured from the output write to ISR entry.
+    \item \textbf{Sensor:} no load cell was available; the HX711 data-ready signal was emulated with a periodic timer at its two datasheet rates, 80\,SPS (12.5\,ms) and 10\,SPS (100\,ms) \cite{HX711}, with vehicles arriving at random times. The on-chip ADC was read for $T_{adc}$.
+    \item \textbf{Storage:} RAM buffer, LittleFS on internal flash (write+flush, buffered write, open-append-close) and USB serial to a PC.
+    \item \textbf{Samples:} 2000 interrupt, ADC and compute samples per filter; 2000 RAM and 300 flash/serial storage samples per mode; 300 (80\,SPS) and 60 (10\,SPS) end-to-end events per storage mode; one complete measurement run.
+\end{itemize}
+
+% ==========================================
+% 4. RESULTS
+% ==========================================
+\section{Results}
+
+\subsection{ILP Speedup of the Compute Segment (gem5)}
+
+\begin{table}[h!]
+\centering
+\caption{Filter-only compute: cycles per sample (-O2) and speedup vs.\ Minor-w1}
+\vspace{0.2cm}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Core} & \textbf{EMA1} & \textbf{IIR16} & \textbf{FIR16} & \textbf{MED5} \\ \midrule
+Timing   & 73.0 (0.81$\times$) & 245.0 (0.88$\times$) & 287.0 (0.99$\times$) & 354.9 (0.90$\times$) \\
+Minor-w1 & 59.0 (1.00$\times$) & 215.0 (1.00$\times$) & 283.0 (1.00$\times$) & 318.9 (1.00$\times$) \\
+Minor-w2 & 41.0 (1.44$\times$) & 147.0 (1.46$\times$) & 200.0 (1.41$\times$) & 215.2 (1.48$\times$) \\
+O3-w1    & 44.0 (1.34$\times$) & 172.0 (1.25$\times$) & 223.0 (1.27$\times$) & 257.9 (1.24$\times$) \\
+O3-w2    & 23.0 (2.56$\times$) & 108.0 (1.99$\times$) & 132.0 (2.14$\times$) & 147.7 (2.16$\times$) \\
+O3-w4    & 13.0 (4.53$\times$) &  99.0 (2.17$\times$) &  70.0 (4.04$\times$) &  98.9 (3.22$\times$) \\
+O3-w8    &  9.0 (6.54$\times$) &  99.0 (2.17$\times$) &  49.0 (5.77$\times$) &  88.9 (3.59$\times$) \\ \bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h!]
+\centering
+\caption{Full processing chain (filter + calibration + packing + CRC32): cycles per sample (-O2)}
+\vspace{0.2cm}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Core} & \textbf{EMA1} & \textbf{IIR16} & \textbf{FIR16} & \textbf{MED5} \\ \midrule
+Timing   & 2076.0 (0.97$\times$) & 2247.8 (0.96$\times$) & 2290.2 (0.98$\times$) & 2358.1 (0.96$\times$) \\
+Minor-w1 & 2010.4 (1.00$\times$) & 2166.0 (1.00$\times$) & 2234.2 (1.00$\times$) & 2269.6 (1.00$\times$) \\
+Minor-w2 & 1278.5 (1.57$\times$) & 1387.3 (1.56$\times$) & 1441.0 (1.55$\times$) & 1456.0 (1.56$\times$) \\
+O3-w1    & 1542.3 (1.30$\times$) & 1668.4 (1.30$\times$) & 1721.9 (1.30$\times$) & 1755.7 (1.29$\times$) \\
+O3-w2    &  882.7 (2.28$\times$) &  969.4 (2.23$\times$) &  988.8 (2.26$\times$) & 1003.7 (2.26$\times$) \\
+O3-w4    &  829.3 (2.42$\times$) &  919.4 (2.36$\times$) &  891.2 (2.51$\times$) &  925.0 (2.45$\times$) \\
+O3-w8    &  820.2 (2.45$\times$) &  855.5 (2.53$\times$) &  845.7 (2.64$\times$) &  921.4 (2.46$\times$) \\ \bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[h!]
+    \centering
+    \safefig{0.98}{fig_speedup_ilp.png}
+    \caption{Compute speedup from ILP relative to the in-order single-issue core. Left: filter only; right: full chain.}
+\end{figure}
+
+The independent FIR16 keeps scaling up to 5.77$\times$ at width 8, whereas the dependency chain of IIR16 saturates at 99 cycles (2.17$\times$) from width 4 onwards. The full chain saturates at about 2.5$\times$ because the bit-serial CRC32 (about 87\% of the cycles) is itself a dependency chain. Increasing width beyond 2--4 yields diminishing returns.
+
+\begin{figure}[h!]
+    \centering
+    \safefig{0.95}{fig_compiler_opt.png}
+    \caption{Effect of compiler optimisation on in-order (Minor-w1) and out-of-order (O3-w4) cores.}
+\end{figure}
+
+Moving from \texttt{-O0} to \texttt{-O2} speeds up the full chain by 2.6--2.7$\times$ on Minor-w1 and 3.4--3.5$\times$ on O3-w4. Moving further to \texttt{-O3 -funroll-loops} gives 1.81--1.85$\times$ on the in-order core (FIR16: 2234$\rightarrow$1236 cycles) but only 1.23--1.26$\times$ on the OoO core (FIR16: 891$\rightarrow$727 cycles): static scheduling and unrolling recover much of the ILP that OoO hardware would otherwise extract dynamically. Enlarging the ROB from 16 to 32 entries reduces cycles by 7--11\%, while the further eight-fold increase from 32 to 256 entries yields only about 10\% more (FIR16: 1062$\rightarrow$949$\rightarrow$846 cycles), showing diminishing returns from a larger instruction window (Figure~\ref{fig:rob}).
+
+\begin{figure}[h!]
+    \centering
+    \safefig{0.7}{fig_rob_sweep.png}
+    \caption{Effect of reorder-buffer size (O3, width 4, -O2).}
+    \label{fig:rob}
+\end{figure}
+
+\FloatBarrier
+\subsection{Hardware Validation (ESP32-S3)}
+\begin{figure}[h!]
+    \centering
+    \safefig{0.75}{fig_hw_vs_gem5.png}
+    \caption{Full-chain compute cycles: ESP32-S3 measurement vs.\ gem5.}
+\end{figure}
+
+The ESP32-S3 needs 1074--1230 cycles per sample (4.5--5.1\,$\mu$s), between gem5 Minor-w1 and O3-w8 and within the same order of magnitude. The $\approx$1.85$\times$ gap is attributed to the different ISA (32-bit Xtensa with zero-overhead loops vs.\ 64-bit RISC-V); gem5 results are therefore used only as relative speedups.
+
+\begin{table}[h!]
+\centering
+\caption{Hardware micro-benchmarks on ESP32-S3 ($\mu$s)}
+\vspace{0.2cm}
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+\textbf{Measurement} & \textbf{n} & \textbf{Median} & \textbf{Mean} & \textbf{p99} & \textbf{Max} \\ \midrule
+$T_{irq}$ (GPIO interrupt)        & 2000 & 1.80     & 1.80     & 1.83      & 1.93 \\
+$T_{adc}$ (analogRead)            & 2000 & 46.10    & 46.34    & 50.76     & 51.14 \\
+HX711 wait, 80 SPS (emulated)     & 200  & 6396.34  & 6342.27  & 12245.32  & 12399.10 \\
+HX711 wait, 10 SPS (emulated)     & 60   & 43675.93 & 47169.98 & 97850.96  & 98986.14 \\
+Compute FIR16, full chain         & 2000 & 5.03     & 5.06     & 5.14      & 26.70 \\
+Calibration, fixed-point          & 1000 & 0.07     & 0.08     & 0.07      & 0.82 \\
+Calibration, float                & 1000 & 0.12     & 0.12     & 0.12      & 0.30 \\
+Store: RAM                        & 2000 & 0.21     & 0.21     & 0.21      & 0.60 \\
+Store: LittleFS write + flush     & 300  & 30949.53 & 33679.73 & 131600.43 & 138090.72 \\
+Store: LittleFS buffered          & 300  & 9.11     & 109.23   & 13.59     & 29271.79 \\
+Store: LittleFS open-append-close & 300  & 39657.56 & 44632.78 & 148220.16 & 153533.85 \\
+Store: USB serial                 & 300  & 38.23    & 487.95   & 995.59    & 995.59 \\ \bottomrule
+\end{tabular}
+\end{table}
+
+\FloatBarrier
+\subsection{End-to-End Latency on Hardware}
+
+\begin{table}[h!]
+\centering
+\caption{Measured trigger-to-storage latency on ESP32-S3 (median, $\mu$s; FIR16, -O2)}
+\vspace{0.2cm}
+\begin{tabular}{@{}lccccccc@{}}
+\toprule
+\textbf{Scenario} & $T_{irq}$ & $T_{wait}$ & $T_{adc}$ & $T_{compute}$ & $T_{store}$ & $T_{total}$ & \textbf{Compute \%} \\ \midrule
+80 SPS + RAM      & 1.8 & 6422.4  & 46.5 & 5.1  & 0.2     & 6476.1  & 0.078 \\
+80 SPS + LittleFS & 3.9 & 5949.4  & 71.8 & 11.0 & 30880.7 & 37459.0 & 0.029 \\
+10 SPS + RAM      & 1.8 & 51310.3 & 46.5 & 5.1  & 0.2     & 51364.0 & 0.010 \\
+10 SPS + LittleFS & 3.9 & 43799.8 & 71.8 & 12.2 & 28390.4 & 72463.6 & 0.017 \\ \bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[h!]
+    \centering
+    \safefig{0.9}{fig_hw_e2e.png}
+    \caption{Components of the trigger-to-storage latency measured on the ESP32-S3 (log scale).}
+\end{figure}
+
+Projected with the best gem5 speedup (O3-w8, 2.64$\times$), ILP would shorten the end-to-end latency by only 0.049\% (80\,SPS, RAM) and 0.018\% (80\,SPS, LittleFS), and by at most 0.010\% at 10\,SPS --- far below the 20\% threshold.
+
+\begin{figure}[h!]
+    \centering
+    \safefig{0.48}{fig_hw_irq.png}\hfill
+    \safefig{0.48}{fig_hw_storage.png}
+    \caption{Left: interrupt latency distribution (n = 2000). Right: time to store one 24-byte record by storage mode (log scale).}
+\end{figure}
+
+Interrupt latency is highly deterministic (median 1.80\,$\mu$s, p99 1.83\,$\mu$s), whereas flash storage with flush shows a median of 30.9\,ms, a p99 of 131.6\,ms and a maximum of 138.1\,ms caused by sector erases. Buffered writes take only 9.1\,$\mu$s (median) but occasionally stall for 29.3\,ms when the buffer is committed, and USB serial output is bimodal (38\,$\mu$s median, up to 1\,ms) due to 1\,ms USB frames.
+
+\FloatBarrier
+\subsection{Sensitivity Analysis}
+\begin{table}[h!]
+\centering
+\caption{Break-even total I/O time below which ILP reduces end-to-end latency by $\geq$20\% (FIR16, vs.\ Minor-w1)}
+\vspace{0.2cm}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{ILP core} & \textbf{@240 MHz} & \textbf{@16 MHz} \\ \midrule
+Minor-w2 & 7.2\,$\mu$s  & 108.2\,$\mu$s \\
+O3-w2    & 16.6\,$\mu$s & 249.5\,$\mu$s \\
+O3-w4    & 18.7\,$\mu$s & 280.0\,$\mu$s \\
+O3-w8    & 19.6\,$\mu$s & 294.3\,$\mu$s \\ \bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[h!]
+    \centering
+    \safefig{0.95}{fig_sensitivity.png}
+    \caption{End-to-end latency reduction from ILP as a function of total I/O time (FIR16). Vertical lines mark datasheet I/O costs.}
+\end{figure}
+
+% ================= DISCUSSION =================
+\section{Discussion}
+\noindent \textbf{Answer to the research question.} ILP significantly accelerates computation (H1 confirmed: the gain is bounded by data dependencies, as predicted by \cite{Wall1991}), but it does \emph{not} significantly reduce the trigger-to-storage latency of a realistic weighing station (H2 confirmed). Computation is three to four orders of magnitude shorter than the sensor wait and storage time.
+
+\vspace{0.2cm}
+\noindent \textbf{The memory system matters more than ILP.} When flash writes are interleaved, the compute segment doubles (5.1$\rightarrow$11.0\,$\mu$s), the interrupt latency doubles (1.8$\rightarrow$3.9\,$\mu$s) and the ADC read grows by 54\% (46.5$\rightarrow$71.8\,$\mu$s), because the ESP32-S3 executes code from external flash through a cache that is disabled during flash writes. This effect alone exceeds the entire ILP saving and is not modelled by gem5.
+
+\vspace{0.2cm}
+\noindent \textbf{Jitter comes from I/O (H3).} The in-order core shows almost constant compute and interrupt times (compute p99 within 2\% of the median), while flash storage varies by about 4.5$\times$ between median and maximum. OoO cores would add data-dependent timing variation and timing anomalies \cite{Lundqvist1999}, making WCET analysis harder \cite{Li2006, Wilhelm2008} for no measurable latency benefit.
+
+\vspace{0.2cm}
+\noindent \textbf{When would ILP matter?} Only when the I/O path is shorter than about 20\,$\mu$s at 240\,MHz, or a few hundred microseconds on a 16\,MHz microcontroller --- for example direct ADC sampling into RAM with heavy on-line processing (encryption, advanced filtering, multiple sensors).
+
+\vspace{0.2cm}
+\noindent \textbf{Design recommendations.} 1) Keep a simple in-order core and use compiler optimisation (\texttt{-O3}). 2) Reduce latency on the I/O side: run the HX711 at 80\,SPS, buffer records in RAM and let a separate task flush to flash. 3) Choose algorithms with short dependency chains (e.g.\ table-driven or hardware CRC instead of bit-serial CRC).
+
+% ================= THREATS TO VALIDITY =================
+\section{Threats to Validity}
+\begin{itemize}
+    \item \textbf{Simulator accuracy:} gem5 models a generic RISC-V core, not the Xtensa LX7; absolute cycles differ by about 1.85$\times$. Only relative speedups are used \cite{Butko2012, Endo2014}.
+    \item \textbf{Syscall-emulation mode:} interrupts, peripherals and flash are not simulated in gem5; these segments were measured on hardware or taken from datasheets.
+    \item \textbf{Emulated sensor:} no load cell was used; the HX711 timing was emulated from its datasheet rates and weight values are synthetic. Processing time does not depend on the weight value.
+    \item \textbf{Storage medium:} internal flash (LittleFS) was used instead of an SD card; both are flash-based with millisecond-scale writes.
+    \item \textbf{Single board and run:} results come from one ESP32-S3 board and a single measurement run; framework overhead (Arduino \texttt{attachInterrupt}) is included in $T_{irq}$.
+\end{itemize}
+
+% ================= AI USAGE =================
+\section{AI Usage Statement}
+\fillin{[Required by the course policy: describe where AI tools were used (e.g.\ troubleshooting the gem5 build, debugging scripts, explaining concepts), how outputs were verified, and at least one AI suggestion the group rejected and why.]}
+
+% ================= CONCLUSION =================
+\section{Conclusion}
+This study evaluated whether ILP can significantly reduce the sensor-trigger-to-storage latency of a smart weighing station. Using a shared weighing kernel in gem5 and on an ESP32-S3, we showed that ILP speeds up computation by up to 6.5$\times$ (2.6$\times$ for the full chain), but computation represents less than 0.1\% of the measured end-to-end latency. ILP therefore does not significantly reduce this latency; it becomes relevant only when the I/O path is shorter than about 20\,$\mu$s.
+
+Our contributions are threefold: (1) a five-segment latency model with an explicit significance threshold; (2) a gem5 exploration of issue width, in-order vs.\ OoO execution, ROB size and compiler optimisation using the same code as the hardware; (3) hardware validation and a break-even analysis that tells designers when ILP is worth its cost.
+
+Future work: measure with a real load cell, HX711 and SD card; place the kernel and ISR in internal RAM (IRAM) to remove flash-cache interference; evaluate table-driven and hardware CRC; and run gem5 in full-system mode to model interrupts.
+
+% ================= REFERENCES =================
+\begin{thebibliography}{99}
+\bibitem{JouppiWall1989} N. P. Jouppi and D. W. Wall, ``Available instruction-level parallelism for superscalar and superpipelined machines,'' in \textit{Proc. ASPLOS-III}, 1989, pp. 272--282.
+\bibitem{Wall1991} D. W. Wall, ``Limits of instruction-level parallelism,'' in \textit{Proc. ASPLOS-IV}, 1991, pp. 176--188.
+\bibitem{SmithSohi1995} J. E. Smith and G. S. Sohi, ``The microarchitecture of superscalar processors,'' \textit{Proc. IEEE}, vol. 83, no. 12, pp. 1609--1624, 1995.
+\bibitem{Lundqvist1999} T. Lundqvist and P. Stenström, ``Timing anomalies in dynamically scheduled microprocessors,'' in \textit{Proc. 20th IEEE Real-Time Systems Symp. (RTSS)}, 1999, pp. 12--21.
+\bibitem{Li2006} X. Li, A. Roychoudhury, and T. Mitra, ``Modeling out-of-order processors for WCET analysis,'' \textit{Real-Time Systems}, vol. 34, no. 3, pp. 195--227, 2006.
+\bibitem{Wilhelm2008} R. Wilhelm \textit{et al.}, ``The worst-case execution-time problem---overview of methods and survey of tools,'' \textit{ACM Trans. Embedded Computing Systems}, vol. 7, no. 3, 2008.
+\bibitem{Binkert2011} N. Binkert \textit{et al.}, ``The gem5 simulator,'' \textit{ACM SIGARCH Computer Architecture News}, vol. 39, no. 2, pp. 1--7, 2011.
+\bibitem{LowePower2020} J. Lowe-Power \textit{et al.}, ``The gem5 simulator: Version 20.0+,'' arXiv:2007.03152, 2020.
+\bibitem{Endo2014} F. A. Endo, D. Couroussé, and H.-P. Charles, ``Micro-architectural simulation of in-order and out-of-order ARM microprocessors with gem5,'' in \textit{Proc. SAMOS XIV}, 2014, pp. 266--273.
+\bibitem{Butko2012} A. Butko, R. Garibotti, L. Ost, and G. Sassatelli, ``Accuracy evaluation of GEM5 simulator system,'' in \textit{Proc. ReCoSoC}, 2012, pp. 1--7.
+\bibitem{HX711} Avia Semiconductor, \textit{HX711: 24-Bit Analog-to-Digital Converter (ADC) for Weigh Scales}, datasheet.
+\bibitem{ESP32S3} Espressif Systems, \textit{ESP32-S3 Technical Reference Manual}.
+\end{thebibliography}
+
+\end{document}
